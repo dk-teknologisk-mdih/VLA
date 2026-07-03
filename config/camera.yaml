@@ -1,0 +1,26 @@
+defaults:
+  - _self_
+  - network
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+robot_cam_serial_numbers:
+  - '238122071139'  # needs to be high res for recording
+  # - '238122071139'  # not used
+  # - '238122071139'  # robot camera
+
+cam_configs:  # if the width and height are changed, they also need to be changed in constants.py
+  width: 640
+  height: 360
+  fps: 30
+  processing_preset: 1 # High accuracy mode
+  rotation_angle: 0
+  depth: False
+
+oculus_cam: 0 # First camera
+num_cams: 1
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

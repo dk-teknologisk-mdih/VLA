@@ -1,0 +1,19 @@
+controller_type: JOINT_POSITION
+
+is_delta: false
+
+# Scales the joint velocity/acceleration limits of the SMOOTH_JOINT_POSITION
+# interpolator. Higher = faster motion. Clamped to (0, 1.0] on the C++ side.
+speed_factor: 0.1
+
+traj_interpolator_cfg:
+  traj_interpolator_type: SMOOTH_JOINT_POSITION
+  time_fraction: 0.3
+
+state_estimator_cfg:
+  is_estimation: false
+  state_estimator_type: EXPONENTIAL_SMOOTHING
+  alpha_q: 0.9
+  alpha_dq: 0.9
+  alpha_eef: 1.0
+  alpha_eef_vel: 1.0
