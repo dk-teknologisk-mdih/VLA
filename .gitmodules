@@ -1,0 +1,9 @@
+[submodule "deoxys_control"]
+	path = deoxys_control
+	url = https://github.com/dk-teknologisk-mdih/deoxys_control.git
+[submodule "openteach"]
+	path = openteach
+	url = https://github.com/dk-teknologisk-mdih/openteach.git
+[submodule "openvla"]
+	path = openvla
+	url = https://github.com/openvla/openvla.git
