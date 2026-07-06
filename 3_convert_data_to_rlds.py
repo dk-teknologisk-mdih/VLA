@@ -299,9 +299,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--pattern",
-        default="demo_*.pkl",
-        help="Glob pattern (searched recursively under --data-dir) for demo "
-        "pkl files (default: demo_*.pkl).",
+        default="*",
+        help="Glob pattern for the demo name that follows the 'demo_' prefix "
+        "and precedes the '.pkl' extension (searched recursively under "
+        "--data-dir). Default '*' matches all demo_*.pkl files.",
     )
     parser.add_argument(
         "--output-dir",
