@@ -48,6 +48,7 @@ import argparse
 import glob
 import os
 import pickle
+import random
 import shutil
 import sys
 import types
@@ -64,7 +65,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 # instantiates builders without arguments, so runtime options are passed here).
 CONFIG = {
     "demo_paths": [],
-    "instruction": "",
+    "instructions": [],
     "image_size": 256,
     "cam_index": 0,
     "flip_gripper": False,
@@ -114,7 +115,9 @@ def _build_steps(demo: dict) -> list:
     from scipy.spatial.transform import Rotation as R
     import cv2
 
-    instruction = CONFIG["instruction"]
+    # Pick one instruction at random for the whole episode. This enables
+    # instruction augmentation when multiple synonyms are supplied.
+    instruction = random.choice(CONFIG["instructions"])
     cam_index = CONFIG["cam_index"]
     img_size = CONFIG["image_size"]
     flip_gripper = CONFIG["flip_gripper"]
@@ -285,8 +288,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--instruction",
-        required=True,
-        help="Natural language task instruction applied to every demo.",
+        help="Natural language task instruction applied to every demo. "
+        "Mutually exclusive with --instruction-file.",
+    )
+    parser.add_argument(
+        "--instruction-file",
+        help="Path to a text file with one instruction (synonym) per line. "
+        "A random line is chosen for each episode to augment instructions. "
+        "Mutually exclusive with --instruction.",
     )
     parser.add_argument(
         "--pattern",
@@ -333,6 +342,20 @@ def main() -> None:
     if not args.dataset_name.replace("_", "").isalnum() or not args.dataset_name.islower():
         parser.error("--dataset-name must contain only lowercase letters, digits, and underscores.")
 
+    if bool(args.instruction) == bool(args.instruction_file):
+        parser.error("Provide exactly one of --instruction or --instruction-file.")
+
+    if args.instruction_file:
+        instruction_file = os.path.abspath(os.path.expanduser(args.instruction_file))
+        if not os.path.isfile(instruction_file):
+            parser.error(f"--instruction-file does not exist: {instruction_file}")
+        with open(instruction_file, "r") as f:
+            instructions = [line.strip() for line in f if line.strip()]
+        if not instructions:
+            parser.error(f"--instruction-file is empty: {instruction_file}")
+    else:
+        instructions = [args.instruction]
+
     _ensure_easydict_importable()
 
     data_dir = os.path.abspath(os.path.expanduser(args.data_dir))
@@ -352,7 +375,7 @@ def main() -> None:
         {
             "demo_paths": demo_paths,
             "data_dir": data_dir,
-            "instruction": args.instruction,
+            "instructions": instructions,
             "image_size": args.image_size,
             "cam_index": args.cam_index,
             "flip_gripper": args.flip_gripper,
