@@ -370,11 +370,24 @@ def main() -> None:
     output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     builder = builder_cls(data_dir=output_dir)
 
+    existing = os.path.join(output_dir, args.dataset_name)
     if args.overwrite:
-        existing = os.path.join(output_dir, args.dataset_name)
         if os.path.isdir(existing):
             print(f"Removing existing dataset at {existing}")
             shutil.rmtree(existing)
+    elif os.path.isdir(existing):
+        # TFDS's download_and_prepare() is a silent no-op when a prepared
+        # dataset of the same name/version already exists. That means a stale
+        # dataset from a previous run would be reused and the new demos/pattern/
+        # instructions would be ignored without any warning. Fail loudly so the
+        # user knows nothing was regenerated.
+        parser.error(
+            f"A prepared dataset already exists at {existing}.\n"
+            "TFDS will NOT regenerate it, so your current --pattern / "
+            "--instruction(s) would be ignored and the old data reused.\n"
+            "Re-run with --overwrite to delete it and rebuild from the demos "
+            "found above."
+        )
 
     print(f"\nBuilding RLDS dataset '{args.dataset_name}' -> {output_dir} ...")
     builder.download_and_prepare()
