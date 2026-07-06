@@ -123,12 +123,20 @@ launch() {
     local cmd="$3"
     local pidfile="${4:-}"
 
+    # --no-dbus (-u) makes every terminator window its own independent process
+    # instead of handing off to a single-instance master over DBus. That way the
+    # PID captured in $! below really is the window's process and kill_windows()
+    # can close each window with a signal.
+    #
+    # Each independent (--no-dbus) instance tries to grab the same global
+    # hide_window hotkey and prints a harmless GTK "Binding ... failed" warning
+    # to this parent terminal, so terminator's stderr is discarded.
     if [[ -n "$pidfile" ]]; then
-        terminator -T "$title" -e \
-            "bash -ic 'cd \"$workdir\" && source $VENV_PATH && echo \"[$title] \$ $cmd\"; $cmd & echo \$! > \"$pidfile\"; wait \$!; echo; echo \"[$title] process exited — press Enter to close\"; read; exec bash'" &
+        terminator -u -T "$title" -e \
+            "bash -ic 'cd \"$workdir\" && source $VENV_PATH && echo \"[$title] \$ $cmd\"; $cmd & echo \$! > \"$pidfile\"; wait \$!; echo; echo \"[$title] process exited — press Enter to close\"; read; exec bash'" 2>/dev/null &
     else
-        terminator -T "$title" -e \
-            "bash -ic 'cd \"$workdir\" && source $VENV_PATH && echo \"[$title] \$ $cmd\" && $cmd; echo; echo \"[$title] process exited — press Enter to close\"; read; exec bash'" &
+        terminator -u -T "$title" -e \
+            "bash -ic 'cd \"$workdir\" && source $VENV_PATH && echo \"[$title] \$ $cmd\" && $cmd; echo; echo \"[$title] process exited — press Enter to close\"; read; exec bash'" 2>/dev/null &
     fi
     # Remember this window's PID so it can be closed later if requested.
     WINDOW_PIDS+=("$!")
