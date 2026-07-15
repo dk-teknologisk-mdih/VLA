@@ -243,6 +243,26 @@ stop_recording() {
 
 echo "Starting local recording pipeline with name: '$NAME'"
 
+# --------------------------------------------------------------------------- #
+# Release ZMQ ports that may be held by a previous (crashed) run before
+# starting any new FrankaInterface instances.  FrankaInterface binds to the
+# PC-side publisher ports (SUB_PORT=5555, GRIPPER_SUB_PORT=5557) in its
+# constructor, so any leftover process holding those ports must be gone first.
+# --------------------------------------------------------------------------- #
+for port in 5555 5557; do
+    pids="$(lsof -ti tcp:"$port" 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+        echo "Releasing port $port (PIDs: $pids)..."
+        echo "$pids" | xargs -r kill -TERM 2>/dev/null || true
+        sleep 1
+        # Force-kill anything that didn't exit cleanly.
+        remaining="$(lsof -ti tcp:"$port" 2>/dev/null || true)"
+        if [[ -n "$remaining" ]]; then
+            echo "$remaining" | xargs -r kill -KILL 2>/dev/null || true
+        fi
+    fi
+done
+
 # The robot only accepts commands from one process at a time, so run the two
 # reset scripts sequentially and block until each completes before continuing.
 
