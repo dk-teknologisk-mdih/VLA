@@ -27,17 +27,23 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") --name <recording_name> [--no-kill-windows]
 
-Starts the local recording pipeline (each component in its own terminator window):
+Starts the local recording pipeline and records multiple sequences back-to-back.
+Sequences are saved as <name>_1, <name>_2, … under vla_data/pickle/.
+
   1. Reset robot joints   (deoxys_control/deoxys/examples/reset_robot_joints.py)
-  2. Reset gripper        (openteach/reset_gripper.py)
-  3. Cameras              (openteach/robot_camera.py)
-  4. Teleoperation        (openteach/teleop.py    robot=franka record=<name>)
-  5. Data collection      (openteach/data_collect.py robot=franka demo_num=<name>)
+  2. Cameras              (openteach/robot_camera.py)  — stays up the whole time
+  3. Teleoperation        (openteach/teleop.py    robot=franka record=<name>_N)
+  4. Data collection      (openteach/data_collect.py robot=franka demo_num=<name>_N)
+
+While recording:
+  Press 's'   — save current sequence and prepare the next one
+               (new processes launch paused; press button B on Quest to begin)
+  Press Enter — stop all recording and exit
 
 Options:
-  --name <name>    Name used for both record= and demo_num= (required)
-  --no-kill-windows   Do not close child terminator windows once recording finishes
-  -h, --help       Show this help and exit
+  --name <name>       Base name for all sequences (required)
+  --no-kill-windows   Do not close child terminator windows after recording
+  -h, --help          Show this help and exit
 EOF
 }
 
@@ -155,6 +161,58 @@ kill_windows() {
             kill -TERM "$pid" 2>/dev/null || true
         fi
     done
+}
+
+# --------------------------------------------------------------------------- #
+# Close only the recording windows for the current sequence (teleop +
+# data-collect), leaving the camera window running.
+# --------------------------------------------------------------------------- #
+close_recording_windows() {
+    echo "Closing recording windows for sequence ${SEQ}..."
+    local pid
+    for pid in "${RECORDING_WINDOW_PIDS[@]}"; do
+        [[ -n "$pid" ]] || continue
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+# --------------------------------------------------------------------------- #
+# Remove a sequence folder if recording was never actually started (i.e.
+# button B was never pressed, so arm_control() was never called and the
+# deoxys_obs_cmd_history pickle is an empty dict — a few bytes at most).
+#   $1 = sequence name (e.g. pick_cup_2)
+# --------------------------------------------------------------------------- #
+cleanup_empty_sequence() {
+    local name="$1"
+    local seq_dir="${SCRIPT_DIR}/vla_data/pickle/${name}"
+    local pkl_file="${seq_dir}/deoxys_obs_cmd_history_${name}.pkl"
+
+    [[ -d "$seq_dir" ]] || return 0
+
+    # If the pkl file hasn't appeared yet (process still shutting down), wait.
+    if [[ ! -f "$pkl_file" ]]; then
+        sleep 2
+    fi
+
+    local is_empty=false
+    if [[ ! -f "$pkl_file" ]]; then
+        is_empty=true
+    else
+        local pkl_size
+        pkl_size="$(stat -c%s "$pkl_file" 2>/dev/null || echo 0)"
+        # An empty dict pickle is ~5 bytes; anything under 100 bytes means no
+        # data was recorded (arm_control() was never called).
+        if [[ "$pkl_size" -lt 100 ]]; then
+            is_empty=true
+        fi
+    fi
+
+    if [[ "$is_empty" == true ]]; then
+        echo "Sequence '${name}' was never started (button B not pressed) — removing empty folder."
+        rm -rf "$seq_dir"
+    fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -276,41 +334,94 @@ run_blocking "reset-joints" "$DEOXYS_EXAMPLES_DIR" "python reset_robot_joints.py
 launch "cameras" "$OT_DIR" "python robot_camera.py"
 sleep 5
 
-# 4. Start teleoperation, recording the action/observation history under <name>.
-launch "teleop" "$OT_DIR" "python teleop.py robot=franka record=$NAME" "$TELEOP_PIDFILE"
-sleep 3
-
-# 5. Start data collection, saving to vla_data/pickle/<name>/.
-launch "data-collect" "$OT_DIR" "python data_collect.py robot=franka demo_num=$NAME" "$COLLECT_PIDFILE"
-
-cat <<EOF
-
-All local components launched (each in its own terminator window):
-  cameras, teleop, data-collect
-  (reset-joints and reset-gripper already ran and completed)
-
-Recording name : $NAME
-  teleop record= $NAME
-  demo_num=       $NAME  -> vla_data/pickle/$NAME/
-
-The cameras / reset windows keep running independently.
-EOF
-
 # Stop the recording scripts on Ctrl+C / termination of THIS script too.
 trap 'stop_recording' INT TERM
 
-# Everything is up — announce over the Logitech MeetUp that recording can begin.
-announce "Start recording"
+# --------------------------------------------------------------------------- #
+# Multi-sequence recording loop.
+#
+# Each iteration launches teleop + data-collect under <name>_N and waits for
+# the user to interact:
+#   's'   — save this sequence (SIGINT) and prepare the next one; new processes
+#            launch immediately but stay PAUSED until button B is pressed on
+#            the Quest, giving time to reset the scene between recordings.
+#   Enter — stop all recording and exit the script.
+# --------------------------------------------------------------------------- #
+SEQ=1
+RECORDING_WINDOW_PIDS=()
 
-echo
-read -r -p "Press Enter here to STOP recording (teleop + data_collect)... " _
+while true; do
+    CURRENT_NAME="${NAME}_${SEQ}"
+    STOP_ANNOUNCED=false
 
-stop_recording
+    # Start teleoperation for this sequence.
+    launch "teleop-${SEQ}" "$OT_DIR" \
+        "python teleop.py robot=franka record=${CURRENT_NAME}" "$TELEOP_PIDFILE"
+    RECORDING_WINDOW_PIDS+=("${WINDOW_PIDS[-1]}")
+    sleep 3
+
+    # Start data collection for this sequence.
+    launch "data-collect-${SEQ}" "$OT_DIR" \
+        "python data_collect.py robot=franka demo_num=${CURRENT_NAME}" "$COLLECT_PIDFILE"
+    RECORDING_WINDOW_PIDS+=("${WINDOW_PIDS[-1]}")
+
+    cat <<EOF
+
+Sequence ${SEQ} ready — recording name: '${CURRENT_NAME}'
+  -> vla_data/pickle/${CURRENT_NAME}/
+
+  Processes are PAUSED — press button B on the Quest to start recording.
+
+  Press 's'   to save this sequence and prepare the next one.
+  Press Enter to stop all recording and exit.
+EOF
+
+    announce "Recording ${SEQ} ready. Press button B to start."
+
+    # Poll for a single keypress: 's' = save + next, Enter = stop.
+    user_action="stop"
+    while true; do
+        if IFS= read -r -n 1 -s -t 0.5 key 2>/dev/null; then
+            case "$key" in
+                s|S)
+                    user_action="save"
+                    break
+                    ;;
+                $'\n'|"")
+                    user_action="stop"
+                    break
+                    ;;
+            esac
+        fi
+    done
+
+    echo
+    stop_recording
+
+    if [[ "$KILL_WINDOWS" == true ]]; then
+        # Give processes time to flush .pkl / video files after SIGINT.
+        sleep 3
+        close_recording_windows
+    fi
+
+    # Remove the folder if recording was never started (button B not pressed).
+    cleanup_empty_sequence "$CURRENT_NAME"
+
+    if [[ "$user_action" == "stop" ]]; then
+        break
+    fi
+
+    # Prepare for the next sequence.
+    SEQ=$((SEQ + 1))
+    RECORDING_WINDOW_PIDS=()
+
+    echo
+    echo "Sequence $((SEQ - 1)) saved to vla_data/pickle/${NAME}_$((SEQ - 1))/"
+    echo "Reset the scene, then press button B on the Quest to start sequence ${SEQ}."
+    announce "Saved. Reset the scene, then press button B to start recording ${SEQ}."
+done
 
 if [[ "$KILL_WINDOWS" == true ]]; then
-    # Give the recording scripts a moment to flush their .pkl / video files
-    # after receiving SIGINT before tearing their windows down.
-    sleep 3
     kill_windows
 fi
 
@@ -318,7 +429,7 @@ trap - INT TERM
 rm -rf "$PID_DIR"
 
 if [[ "$KILL_WINDOWS" == true ]]; then
-    echo "Recording scripts signalled to stop and child windows closed."
+    echo "All recording windows closed."
 else
-    echo "Recording scripts signalled to stop. Check their windows for the saved files."
+    echo "Recording scripts stopped. Check their windows for the saved files."
 fi
