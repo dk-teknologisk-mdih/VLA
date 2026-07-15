@@ -8,8 +8,9 @@
 # name automatically so nothing has to be typed by hand.
 #
 # Usage:
-#   ./record_data.sh --name <recording_name>
+#   ./record_data.sh --name <recording_name> [--start-seq <N>]
 #   ./record_data.sh --name pick_cup
+#   ./record_data.sh --name pick_cup --start-seq 4   # continue from sequence 4
 #
 # The single <recording_name> is used for both:
 #   * teleop.py       -> record=<name>      (deoxys_obs_cmd_history_<name>.pkl)
@@ -21,14 +22,15 @@ set -euo pipefail
 # Argument parsing
 # --------------------------------------------------------------------------- #
 NAME=""
+START_SEQ=1
 KILL_WINDOWS=true
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") --name <recording_name> [--no-kill-windows]
+Usage: $(basename "$0") --name <recording_name> [--start-seq <N>] [--no-kill-windows]
 
 Starts the local recording pipeline and records multiple sequences back-to-back.
-Sequences are saved as <name>_1, <name>_2, … under vla_data/pickle/.
+Sequences are saved as <name>_N, <name>_N+1, … under vla_data/pickle/.
 
   1. Reset robot joints   (deoxys_control/deoxys/examples/reset_robot_joints.py)
   2. Cameras              (openteach/robot_camera.py)  — stays up the whole time
@@ -42,6 +44,7 @@ While recording:
 
 Options:
   --name <name>       Base name for all sequences (required)
+  --start-seq <N>     Starting sequence number (default: 1)
   --no-kill-windows   Do not close child terminator windows after recording
   -h, --help          Show this help and exit
 EOF
@@ -56,6 +59,17 @@ while [[ $# -gt 0 ]]; do
             ;;
         --name=*)
             NAME="${1#*=}"
+            shift
+            ;;
+        --start-seq)
+            [[ $# -ge 2 ]] || { echo "error: --start-seq requires a value" >&2; exit 1; }
+            START_SEQ="$2"
+            [[ "$START_SEQ" =~ ^[1-9][0-9]*$ ]] || { echo "error: --start-seq must be a positive integer" >&2; exit 1; }
+            shift 2
+            ;;
+        --start-seq=*)
+            START_SEQ="${1#*=}"
+            [[ "$START_SEQ" =~ ^[1-9][0-9]*$ ]] || { echo "error: --start-seq must be a positive integer" >&2; exit 1; }
             shift
             ;;
         --no-kill-windows)
@@ -347,7 +361,7 @@ trap 'stop_recording' INT TERM
 #            the Quest, giving time to reset the scene between recordings.
 #   Enter — stop all recording and exit the script.
 # --------------------------------------------------------------------------- #
-SEQ=1
+SEQ=$START_SEQ
 RECORDING_WINDOW_PIDS=()
 
 while true; do
