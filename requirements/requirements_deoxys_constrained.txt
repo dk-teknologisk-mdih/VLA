@@ -1,0 +1,29 @@
+# Deoxys runtime deps, constrained to avoid breaking OpenVLA
+
+# Keep OpenVLA-compatible NumPy
+numpy==1.26.4
+
+# Deoxys deps
+pyzmq
+PyYAML
+easydict
+pybullet
+hidapi
+glfw
+termcolor
+simplejson
+mujoco==3.1.0
+
+# Numba stack compatible with numpy 1.26
+numba==0.59.1
+llvmlite==0.42.0
+
+# Google API stack pinned to avoid protobuf/runtime_version issues
+google-api-python-client==2.95.0
+google-api-core==2.11.1
+google-auth==2.22.0
+google-auth-httplib2==0.1.0
+googleapis-common-protos==1.59.1
+
+# Critical OpenVLA/TFDS protobuf pin
+protobuf==3.20.3
