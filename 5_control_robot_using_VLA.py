@@ -19,7 +19,19 @@ NOTE: openvla-7b + bridge_orig was trained on a WidowX/BridgeData V2 setup. Expe
 to fine-tune and to verify frame/gripper conventions before trusting it on a Franka.
 """
 
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")
+except Exception:
+    pass
+
 import argparse
+import json
 import time
 
 import numpy as np
@@ -27,7 +39,15 @@ import pyrealsense2 as rs
 import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation as R
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+
+try:
+    from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+    from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+    from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+    _PRISMATIC_AVAILABLE = True
+except ImportError:
+    _PRISMATIC_AVAILABLE = False
 
 from deoxys import config_root
 from deoxys.experimental.motion_utils import reset_joints_to
@@ -124,6 +144,14 @@ class RealSenseCamera:
 # ---------------------------------------------------------------------------
 def load_vla(model_name: str, device: str):
     """Load the OpenVLA processor and model onto the requested device."""
+    # Register Prismatic AutoClasses for local checkpoints so weights are loaded
+    # with the correct local class implementations (mirrors openvla_utils.py).
+    if os.path.isdir(model_name) and _PRISMATIC_AVAILABLE:
+        AutoConfig.register("openvla", OpenVLAConfig)
+        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+        logger.info("Registered local Prismatic AutoClasses for OpenVLA.")
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
         model_name,
@@ -132,6 +160,11 @@ def load_vla(model_name: str, device: str):
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device)
+    # Load dataset statistics for fine-tuned models (needed for action un-normalization).
+    stats_path = os.path.join(model_name, "dataset_statistics.json")
+    if os.path.isfile(stats_path):
+        with open(stats_path, "r") as f:
+            vla.norm_stats = json.load(f)
     return processor, vla
 
 
@@ -257,6 +290,10 @@ def main():
     # --- VLA + camera ---
     logger.info(f"Loading OpenVLA model '{args.model}'...")
     processor, vla = load_vla(args.model, args.device)
+    assert args.unnorm_key in vla.norm_stats, (
+        f"--unnorm-key '{args.unnorm_key}' not found in model norm_stats. "
+        f"Available keys: {list(vla.norm_stats.keys())}"
+    )
     prompt = build_prompt(args.instruction)
     logger.info(f"Prompt: {prompt!r}")
 
