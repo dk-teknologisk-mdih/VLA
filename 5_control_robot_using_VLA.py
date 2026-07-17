@@ -109,6 +109,23 @@ def parse_args():
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument(
+        "--save-debug-images",
+        action="store_true",
+        help="Save the image fed to the VLA at each step for debugging.",
+    )
+    parser.add_argument(
+        "--debug-image-dir",
+        type=str,
+        default="logs/debug_images",
+        help="Directory to save per-step debug images (used with --save-debug-images).",
+    )
+    parser.add_argument(
+        "--frame-flush-count",
+        type=int,
+        default=5,
+        help="Number of stale RealSense frames to drain before each inference capture.",
+    )
     return parser.parse_args()
 
 
@@ -125,6 +142,15 @@ class RealSenseCamera:
         self.pipeline.start(config)
         # Discard initial frames so auto-exposure / white-balance can settle.
         for _ in range(warmup_frames):
+            self.pipeline.wait_for_frames()
+
+    def flush(self, n: int = 5) -> None:
+        """Drain stale buffered frames so get_image() returns a current frame.
+
+        The RealSense pipeline buffers frames while the robot is executing.
+        Call this before each inference capture to avoid stale-frame artifacts.
+        """
+        for _ in range(n):
             self.pipeline.wait_for_frames()
 
     def get_image(self) -> Image.Image:
@@ -303,14 +329,22 @@ def main():
         fps=args.camera_fps,
     )
 
+    if args.save_debug_images:
+        os.makedirs(args.debug_image_dir, exist_ok=True)
+        logger.info(f"Debug images will be saved to '{args.debug_image_dir}/'")
+
     period = 1.0 / args.control_hz if args.control_hz > 0 else 0.0
 
     try:
         for step in range(args.max_steps):
             loop_start = time.time()
 
-            # 1. Take a picture.
+            # 1. Flush stale buffered frames, then take a picture.
+            camera.flush(n=args.frame_flush_count)
             image = camera.get_image()
+            if args.save_debug_images:
+                debug_path = os.path.join(args.debug_image_dir, f"step_{step:03d}.jpg")
+                image.save(debug_path)
 
             # 2. Generate an action with OpenVLA.
             action = predict_action(
