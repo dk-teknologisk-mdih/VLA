@@ -6,4 +6,4 @@
 	url = https://github.com/dk-teknologisk-mdih/openteach.git
 [submodule "openvla"]
 	path = openvla
-	url = https://github.com/openvla/openvla.git
+	url = https://github.com/dk-teknologisk-mdih/openvla.git
