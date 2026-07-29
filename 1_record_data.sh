@@ -38,6 +38,7 @@ Sequences are saved as <name>_N, <name>_N+1, … under vla_data/pickle/.
   4. Data collection      (openteach/data_collect.py robot=franka demo_num=<name>_N)
 
 While recording:
+    Press Quest A — save current sequence and prepare the next one
   Press 's'   — save current sequence and prepare the next one
                (new processes launch paused; press button B on Quest to begin)
   Press Enter — stop all recording and exit
@@ -356,6 +357,7 @@ trap 'stop_recording' INT TERM
 #
 # Each iteration launches teleop + data-collect under <name>_N and waits for
 # the user to interact:
+#   Quest A — save this sequence and prepare the next one
 #   's'   — save this sequence (SIGINT) and prepare the next one; new processes
 #            launch immediately but stay PAUSED until button B is pressed on
 #            the Quest, giving time to reset the scene between recordings.
@@ -366,7 +368,12 @@ RECORDING_WINDOW_PIDS=()
 
 while true; do
     CURRENT_NAME="${NAME}_${SEQ}"
+    SEQUENCE_ADVANCE_MARKER="${SCRIPT_DIR}/vla_data/pickle/${CURRENT_NAME}/.quest_a_advance"
     STOP_ANNOUNCED=false
+
+    # This marker is written only after teleop has saved its pickle in response
+    # to Quest A. Remove leftovers from an interrupted prior run of this name.
+    rm -f "$SEQUENCE_ADVANCE_MARKER"
 
     # Start teleoperation for this sequence.
     launch "teleop-${SEQ}" "$OT_DIR" \
@@ -386,15 +393,22 @@ Sequence ${SEQ} ready — recording name: '${CURRENT_NAME}'
 
   Processes are PAUSED — press button B on the Quest to start recording.
 
+    Press Quest A to save this sequence and prepare the next one.
   Press 's'   to save this sequence and prepare the next one.
   Press Enter to stop all recording and exit.
 EOF
 
     announce "Recording ${SEQ} ready. Press button B to start."
 
-    # Poll for a single keypress: 's' = save + next, Enter = stop.
+    # Poll for Quest A's completion marker or a keyboard command.
     user_action="stop"
     while true; do
+        if [[ -f "$SEQUENCE_ADVANCE_MARKER" ]]; then
+            echo "Quest A requested the next sequence."
+            user_action="save"
+            break
+        fi
+
         if IFS= read -r -n 1 -s -t 0.5 key 2>/dev/null; then
             case "$key" in
                 s|S)
