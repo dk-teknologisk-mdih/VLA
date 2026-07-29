@@ -2,3 +2,6 @@
 vla_data/
 logs/
 .venv310/
+runs/
+wandb/
+wandb_key.txt
