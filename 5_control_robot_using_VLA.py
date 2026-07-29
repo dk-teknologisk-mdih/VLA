@@ -19,22 +19,36 @@ NOTE: openvla-7b + bridge_orig was trained on a WidowX/BridgeData V2 setup. Expe
 to fine-tune and to verify frame/gripper conventions before trusting it on a Franka.
 """
 
+# === faulthandler: print Python traceback on SIGSEGV ===
+import faulthandler, sys
+faulthandler.enable(file=sys.stderr)
+
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 try:
     import tensorflow as tf
     tf.config.set_visible_devices([], "GPU")
-except Exception:
+except Exception as e:
     pass
+
+
+# triton/knobs.py segfaults on this system (Python 3.12 + CUDA incompatibility).
+# Setting sys.modules['triton'] = None makes Python raise ImportError on any
+# `import triton`, so torch._dynamo.utils.has_triton_package() returns False
+# instead of crashing.
+sys.modules.setdefault("triton", None)
+
 
 import argparse
 import json
 import time
 
 import numpy as np
+import cv2
 import pyrealsense2 as rs
 import torch
 from PIL import Image
@@ -46,7 +60,7 @@ try:
     from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
     from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
     _PRISMATIC_AVAILABLE = True
-except ImportError:
+except Exception as e:
     _PRISMATIC_AVAILABLE = False
 
 from deoxys import config_root
@@ -110,6 +124,14 @@ def parse_args():
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument(
+        "--train-image-size",
+        type=int,
+        default=None,
+        help="If set, squash each camera frame to this square resolution (INTER_AREA) "
+        "to match the training RLDS dataset (see 3_convert_data_to_rlds.py, e.g. 256). "
+        "If omitted, the raw camera frame is fed to the VLA processor unchanged.",
+    )
+    parser.add_argument(
         "--save-debug-images",
         action="store_true",
         help="Save the image fed to the VLA at each step for debugging.",
@@ -135,7 +157,8 @@ def parse_args():
 class RealSenseCamera:
     """Persistent Intel RealSense color stream returning PIL images."""
 
-    def __init__(self, width=640, height=480, fps=30, warmup_frames=30):
+    def __init__(self, width=640, height=480, fps=30, warmup_frames=30, resize_size=None):
+        self.resize_size = resize_size
         self.pipeline = rs.pipeline()
         config = rs.config()
         config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
@@ -159,6 +182,16 @@ class RealSenseCamera:
         if not color_frame:
             raise RuntimeError("Failed to capture a color frame from the RealSense camera.")
         color_image = np.asanyarray(color_frame.get_data())
+        # Optionally squash to the training resolution (INTER_AREA), mirroring the
+        # RLDS conversion in 3_convert_data_to_rlds.py so the model sees
+        # in-distribution inputs. Frames are already RGB (rs.format.rgb8), so no
+        # BGR flip is needed. When resize_size is None the raw frame is returned.
+        if self.resize_size is not None:
+            color_image = cv2.resize(
+                color_image,
+                (self.resize_size, self.resize_size),
+                interpolation=cv2.INTER_AREA,
+            )
         return Image.fromarray(color_image)
 
     def close(self):
@@ -185,7 +218,8 @@ def load_vla(model_name: str, device: str):
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-    ).to(device)
+        device_map={"": device},
+    )
     # Load dataset statistics for fine-tuned models (needed for action un-normalization).
     stats_path = os.path.join(model_name, "dataset_statistics.json")
     if os.path.isfile(stats_path):
@@ -302,6 +336,16 @@ def wait_for_state(robot_interface):
 def main():
     args = parse_args()
 
+    # Pre-initialize the PyTorch CUDA context *before* deoxys/ZMQ native
+    # libraries start background threads.  Without this, CUDA init that
+    # happens inside from_pretrained() races with already-running C threads
+    # and causes a SIGSEGV (exit 139).
+    if args.device.startswith("cuda"):
+        logger.info(f"Warming up CUDA context on {args.device}...")
+        _t = torch.zeros(1, device=args.device)
+        torch.cuda.synchronize(args.device)
+        del _t
+
     # --- Robot ---
     robot_interface = FrankaInterface(
         config_root + f"/{args.interface_cfg}", use_visualizer=False
@@ -327,6 +371,7 @@ def main():
         width=args.camera_width,
         height=args.camera_height,
         fps=args.camera_fps,
+        resize_size=args.train_image_size,
     )
 
     if args.save_debug_images:
