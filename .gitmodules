@@ -7,3 +7,6 @@
 [submodule "openvla"]
 	path = openvla
 	url = https://github.com/dk-teknologisk-mdih/openvla.git
+[submodule "openvla-oft"]
+	path = openvla-oft
+	url = https://github.com/moojink/openvla-oft.git

@@ -10,7 +10,7 @@ Input:
     ``openteach/visualize_demo.py`` (already time-synced between the camera and
     the robot command/observation history). Each pkl contains, among others:
         - rgb_frames     (N, num_cams, H, W, 3) uint8, BGR (from cv2.VideoCapture)
-        - arm_action     (N, 6) float  -> delta [x, y, z] + delta axis-angle rotvec
+        - arm_action     (N, 6) float  -> 60 Hz OSC servo command (unused here)
         - gripper_action (N,)  int in {-1, 1}   (-1 == open, +1 == close)
         - gripper_state  (N,)  float    -> physical gripper width (~0.08 == open)
         - eef_pose       (N, 4, 4) float -> absolute end-effector homogeneous pose
@@ -28,6 +28,14 @@ Output:
             language_instruction (str, provided via --instruction)
         episode_metadata:
             file_path (str)
+
+    Each demo is first subsampled to roughly --target-hz (default 5 Hz) using
+    the recorded timestamps. The action stored at each retained frame is the
+    pose change the robot ACTUALLY achieved by the next retained frame
+    (world-frame delta position + body-frame delta rotation), computed from
+    consecutive eef_pose entries -- NOT the recorded 60 Hz servo command.
+    This matches exactly how 5_control_robot_using_VLA.py integrates actions
+    onto the current pose at inference time.
 
 Example:
     python convert_to_rlds.py \
@@ -69,6 +77,7 @@ CONFIG = {
     "image_size": 256,
     "cam_index": 0,
     "flip_gripper": False,
+    "target_hz": 5.0,
 }
 
 # Franka Panda hand max opening width (meters); used to normalize gripper state.
@@ -111,7 +120,15 @@ def _load_demo(path: str) -> dict:
 
 
 def _build_steps(demo: dict) -> list:
-    """Turn one loaded demo pkl into a list of RLDS step dicts."""
+    """Turn one loaded demo pkl into a list of RLDS step dicts.
+
+    Frames are subsampled to ~CONFIG["target_hz"] using the recorded
+    timestamps. The action at each retained frame is the pose change the robot
+    ACTUALLY achieved by the next retained frame:
+      - translation: world-frame delta position   (inference: target = pos + d)
+      - rotation:    body-frame delta rotation    (inference: R_t = R @ dR)
+    which matches exactly how 5_control_robot_using_VLA.py applies actions.
+    """
     from scipy.spatial.transform import Rotation as R
     import cv2
 
@@ -121,43 +138,66 @@ def _build_steps(demo: dict) -> list:
     cam_index = CONFIG["cam_index"]
     img_size = CONFIG["image_size"]
     flip_gripper = CONFIG["flip_gripper"]
+    target_hz = CONFIG["target_hz"]
 
     num_frames = len(demo["timestamp"])
     if num_frames == 0:
         return []
 
-    arm_action = np.asarray(demo["arm_action"], dtype=np.float64)  # (N, 6)
+    timestamps = np.asarray(demo["timestamp"], dtype=np.float64).reshape(-1)
     gripper_action = np.asarray(demo["gripper_action"]).reshape(-1)  # (N,) in {-1, 1}
     gripper_state = np.asarray(demo["gripper_state"]).reshape(-1)  # (N,)
     eef_pose = np.asarray(demo["eef_pose"], dtype=np.float64)  # (N, 4, 4)
     rgb_frames = demo["rgb_frames"]  # (N, num_cams, H, W, 3), BGR uint8
 
-    # --- Action: [delta xyz, delta euler (xyz), gripper] ---
-    delta_pos = arm_action[:, :3]
-    # arm_action[:, 3:6] is a rotation vector (axis * angle); convert to Euler.
-    delta_euler = R.from_rotvec(arm_action[:, 3:6]).as_euler("xyz")
-    # Map gripper command {-1 (open), +1 (close)} -> {1.0 (open), 0.0 (close)}
-    # to match OpenVLA's convention (+1 == open). Use --flip-gripper to invert.
-    gripper_open = (gripper_action < 0).astype(np.float32)
+    # --- Subsample the ~60 Hz recording down to target_hz via timestamps ---
+    if target_hz and target_hz > 0:
+        period = 1.0 / target_hz
+        keep = [0]
+        for i in range(1, num_frames):
+            if timestamps[i] - timestamps[keep[-1]] >= period:
+                keep.append(i)
+    else:
+        keep = list(range(num_frames))
+    keep = np.asarray(keep, dtype=np.int64)
+    if keep.size < 2:
+        return []
+
+    cur, nxt = keep[:-1], keep[1:]
+    num_steps = cur.size
+
+    # --- Action: achieved delta pose between consecutive retained frames ---
+    abs_pos = eef_pose[:, :3, 3]  # (N, 3)
+    rot_mat = eef_pose[:, :3, :3]  # (N, 3, 3)
+    # World-frame translation delta (inference: target_pos = current + dpos).
+    delta_pos = abs_pos[nxt] - abs_pos[cur]
+    # Body-frame rotation delta (inference: R_target = R_current @ dR).
+    delta_rot = np.matmul(rot_mat[cur].transpose(0, 2, 1), rot_mat[nxt])
+    delta_euler = R.from_matrix(delta_rot).as_euler("xyz")
+    # Gripper: the command active at the END of the interval, i.e. the state
+    # the gripper should reach by the next step. Map {-1 (open), +1 (close)}
+    # -> {1.0 (open), 0.0 (close)} to match OpenVLA's convention (+1 == open).
+    # Use --flip-gripper to invert.
+    gripper_open = (gripper_action[nxt] < 0).astype(np.float32)
     if flip_gripper:
         gripper_open = 1.0 - gripper_open
     action = np.concatenate(
         [delta_pos, delta_euler, gripper_open[:, None]], axis=1
     ).astype(np.float32)
-    assert action.shape == (num_frames, ACTION_DIM)
+    assert action.shape == (num_steps, ACTION_DIM)
 
     # --- Proprio state: [xyz, euler (xyz), pad, gripper] (POS_EULER layout) ---
-    abs_pos = eef_pose[:, :3, 3]
-    abs_euler = R.from_matrix(eef_pose[:, :3, :3]).as_euler("xyz")
-    pad = np.zeros((num_frames, 1), dtype=np.float64)
-    gripper_norm = np.clip(gripper_state / GRIPPER_MAX_WIDTH, 0.0, 1.0)[:, None]
+    abs_euler = R.from_matrix(rot_mat[cur]).as_euler("xyz")
+    pad = np.zeros((num_steps, 1), dtype=np.float64)
+    gripper_norm = np.clip(gripper_state[cur] / GRIPPER_MAX_WIDTH, 0.0, 1.0)[:, None]
     state = np.concatenate(
-        [abs_pos, abs_euler, pad, gripper_norm], axis=1
+        [abs_pos[cur], abs_euler, pad, gripper_norm], axis=1
     ).astype(np.float32)
-    assert state.shape == (num_frames, STATE_DIM)
+    assert state.shape == (num_steps, STATE_DIM)
 
     steps = []
-    for i in range(num_frames):
+    for k in range(num_steps):
+        i = int(cur[k])
         # BGR -> RGB, then resize to the square resolution OpenVLA expects.
         frame = rgb_frames[i, cam_index][:, :, ::-1]
         image = cv2.resize(frame, (img_size, img_size), interpolation=cv2.INTER_AREA)
@@ -165,14 +205,14 @@ def _build_steps(demo: dict) -> list:
             {
                 "observation": {
                     "image": np.ascontiguousarray(image, dtype=np.uint8),
-                    "state": state[i],
+                    "state": state[k],
                 },
-                "action": action[i],
+                "action": action[k],
                 "discount": np.float32(1.0),
-                "reward": np.float32(1.0 if i == num_frames - 1 else 0.0),
-                "is_first": bool(i == 0),
-                "is_last": bool(i == num_frames - 1),
-                "is_terminal": bool(i == num_frames - 1),
+                "reward": np.float32(1.0 if k == num_steps - 1 else 0.0),
+                "is_first": bool(k == 0),
+                "is_last": bool(k == num_steps - 1),
+                "is_terminal": bool(k == num_steps - 1),
                 "language_instruction": instruction,
             }
         )
@@ -328,6 +368,15 @@ def main() -> None:
         help="Which camera in rgb_frames to use as the primary image (default: 0).",
     )
     parser.add_argument(
+        "--target-hz",
+        type=float,
+        default=5.0,
+        help="Subsample each demo to roughly this control frequency using the "
+        "recorded timestamps before computing actions (default: 5.0). "
+        "Actions become the achieved pose delta between retained frames. "
+        "Set <= 0 to keep every frame.",
+    )
+    parser.add_argument(
         "--flip-gripper",
         action="store_true",
         help="Invert the gripper open/close mapping if your setup differs "
@@ -380,6 +429,7 @@ def main() -> None:
             "image_size": args.image_size,
             "cam_index": args.cam_index,
             "flip_gripper": args.flip_gripper,
+            "target_hz": args.target_hz,
         }
     )
 

@@ -40,11 +40,12 @@ except Exception as e:
 # Setting sys.modules['triton'] = None makes Python raise ImportError on any
 # `import triton`, so torch._dynamo.utils.has_triton_package() returns False
 # instead of crashing.
-sys.modules.setdefault("triton", None)
+# sys.modules.setdefault("triton", None)
 
 
 import argparse
 import json
+import threading
 import time
 
 import numpy as np
@@ -98,8 +99,9 @@ def parse_args():
     parser.add_argument(
         "--steps-per-action",
         type=int,
-        default=20,
-        help="Number of deoxys control cycles used to realize a single VLA action.",
+        default=10,
+        help="Number of deoxys control cycles used to realize a single VLA action "
+        "(default: 10, i.e. ~0.5 s at the 20 Hz deoxys policy rate).",
     )
     parser.add_argument(
         "--max-pos-delta",
@@ -118,10 +120,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--unnorm-key", type=str, default="bridge_orig")
     parser.add_argument("--instruction", type=str, default="grasp the red block")
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--max-steps", type=int, default=250)
     parser.add_argument("--control-hz", type=float, default=5.0)
     parser.add_argument("--camera-width", type=int, default=640)
-    parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--camera-height", type=int, default=360)
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument(
         "--train-image-size",
@@ -143,10 +145,9 @@ def parse_args():
         help="Directory to save per-step debug images (used with --save-debug-images).",
     )
     parser.add_argument(
-        "--frame-flush-count",
-        type=int,
-        default=5,
-        help="Number of stale RealSense frames to drain before each inference capture.",
+        "--no-display",
+        action="store_true",
+        help="Disable the live camera feed window.",
     )
     return parser.parse_args()
 
@@ -155,10 +156,28 @@ def parse_args():
 # RealSense camera (kept open across the loop for efficiency)
 # ---------------------------------------------------------------------------
 class RealSenseCamera:
-    """Persistent Intel RealSense color stream returning PIL images."""
+    """Persistent Intel RealSense color stream returning PIL images.
 
-    def __init__(self, width=640, height=480, fps=30, warmup_frames=30, resize_size=None):
+    A background thread continuously drains the pipeline (so frames are never
+    stale) and optionally shows a live feed window with `overlay_text` drawn
+    on it. All OpenCV GUI calls are confined to that single thread.
+    """
+
+    WINDOW_NAME = "VLA camera feed"
+
+    def __init__(
+        self,
+        width=640,
+        height=480,
+        fps=30,
+        warmup_frames=30,
+        resize_size=None,
+        show_feed=True,
+        overlay_text=None,
+    ):
         self.resize_size = resize_size
+        self.show_feed = show_feed
+        self.overlay_text = overlay_text
         self.pipeline = rs.pipeline()
         config = rs.config()
         config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
@@ -167,21 +186,49 @@ class RealSenseCamera:
         for _ in range(warmup_frames):
             self.pipeline.wait_for_frames()
 
-    def flush(self, n: int = 5) -> None:
-        """Drain stale buffered frames so get_image() returns a current frame.
+        self._lock = threading.Lock()
+        self._latest_frame = None
+        self._running = True
+        self._quit_requested = False
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+        # Block until the first frame has been captured.
+        while True:
+            with self._lock:
+                if self._latest_frame is not None:
+                    break
+            time.sleep(0.01)
 
-        The RealSense pipeline buffers frames while the robot is executing.
-        Call this before each inference capture to avoid stale-frame artifacts.
-        """
-        for _ in range(n):
-            self.pipeline.wait_for_frames()
+    def _capture_loop(self):
+        """Continuously grab frames; keep the latest and show the live feed."""
+        while self._running:
+            frames = self.pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                continue
+            color_image = np.asanyarray(color_frame.get_data())  # RGB
+            with self._lock:
+                self._latest_frame = color_image
+            if self.show_feed:
+                display = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+                if self.overlay_text:
+                    y = 25
+                    for line in self.overlay_text.split("\n"):
+                        # Black outline + white text for readability.
+                        cv2.putText(display, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                        cv2.putText(display, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                        y += 25
+                cv2.imshow(self.WINDOW_NAME, display)
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    self._quit_requested = True
+        if self.show_feed:
+            cv2.destroyWindow(self.WINDOW_NAME)
 
     def get_image(self) -> Image.Image:
-        frames = self.pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            raise RuntimeError("Failed to capture a color frame from the RealSense camera.")
-        color_image = np.asanyarray(color_frame.get_data())
+        with self._lock:
+            color_image = self._latest_frame.copy()
         # Optionally squash to the training resolution (INTER_AREA), mirroring the
         # RLDS conversion in 3_convert_data_to_rlds.py so the model sees
         # in-distribution inputs. Frames are already RGB (rs.format.rgb8), so no
@@ -195,7 +242,14 @@ class RealSenseCamera:
         return Image.fromarray(color_image)
 
     def close(self):
+        self._running = False
+        self._thread.join(timeout=2.0)
         self.pipeline.stop()
+
+    @property
+    def quit_requested(self) -> bool:
+        """True once the user has pressed 'q' in the live feed window."""
+        return self._quit_requested
 
 
 # ---------------------------------------------------------------------------
@@ -212,13 +266,27 @@ def load_vla(model_name: str, device: str):
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
         logger.info("Registered local Prismatic AutoClasses for OpenVLA.")
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    # Use FlashAttention-2 when available: it substantially reduces per-step
+    # inference latency for the 7B model. Fall back to default attention if
+    # flash_attn is missing or broken (e.g. triton stubbed out above).
+    model_kwargs = {}
+    try:
+        import flash_attn  # noqa: F401
+
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+        logger.info("flash_attn detected -> loading with flash_attention_2.")
+    except Exception:
+        logger.warning(
+            "flash_attn not available -> using default attention. "
+            "Install `flash-attn` for significantly faster inference."
+        )
     vla = AutoModelForVision2Seq.from_pretrained(
         model_name,
-        # attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
         device_map={"": device},
+        **model_kwargs,
     )
     # Load dataset statistics for fine-tuned models (needed for action un-normalization).
     stats_path = os.path.join(model_name, "dataset_statistics.json")
@@ -229,13 +297,16 @@ def load_vla(model_name: str, device: str):
 
 
 def build_prompt(instruction: str) -> str:
-    return f"In: What action should the robot take to {instruction}?\nOut:"
+    return f"{instruction}"
 
 
 def predict_action(processor, vla, image, prompt, unnorm_key, device):
     """Run the VLA and return the predicted 7-DoF action (numpy array)."""
     inputs = processor(prompt, image).to(device, dtype=torch.bfloat16)
+    t0 = time.time()
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
+    t1 = time.time()
+    logger.info(f"VLA inference time: {t1 - t0:.4f} seconds")
     return np.asarray(action, dtype=np.float64)
 
 
@@ -355,7 +426,7 @@ def main():
 
     wait_for_state(robot_interface)
     logger.info("Resetting to home joint configuration...")
-    reset_joints_to(robot_interface, RESET_JOINT_POSITIONS)
+    reset_joints_to(robot_interface, RESET_JOINT_POSITIONS, timeout=20)
 
     # --- VLA + camera ---
     logger.info(f"Loading OpenVLA model '{args.model}'...")
@@ -372,6 +443,8 @@ def main():
         height=args.camera_height,
         fps=args.camera_fps,
         resize_size=args.train_image_size,
+        show_feed=not args.no_display,
+        overlay_text=prompt,
     )
 
     if args.save_debug_images:
@@ -384,8 +457,12 @@ def main():
         for step in range(args.max_steps):
             loop_start = time.time()
 
-            # 1. Flush stale buffered frames, then take a picture.
-            camera.flush(n=args.frame_flush_count)
+            # Stop if the user pressed 'q' in the live feed window.
+            if camera.quit_requested:
+                logger.info("'q' pressed; stopping.")
+                break
+
+            # 1. Take a picture (the capture thread keeps the latest frame fresh).
             image = camera.get_image()
             if args.save_debug_images:
                 debug_path = os.path.join(args.debug_image_dir, f"step_{step:03d}.jpg")
